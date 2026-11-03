@@ -145,6 +145,62 @@ public func menuBarTitle(_ state: UsageState?, now: Date) -> String {
     }.joined(separator: " · ")
 }
 
+// MARK: - Presentation
+
+/// Colour band for a usage percentage: green, yellow, orange, red.
+public enum UsageLevel: Int, Sendable, Comparable {
+    case low, moderate, high, critical
+
+    public static func < (a: UsageLevel, b: UsageLevel) -> Bool { a.rawValue < b.rawValue }
+}
+
+public func usageLevel(_ percent: Double) -> UsageLevel {
+    switch percent {
+    case ..<50: return .low
+    case ..<75: return .moderate
+    case ..<90: return .high
+    default: return .critical
+    }
+}
+
+/// The percentage the menu bar shows: the highest current window, i.e. the limit you'll hit first.
+public func headlinePercent(_ state: UsageState?, now: Date) -> Double? {
+    state?.windows.values.map { $0.effectivePercentage(at: now) }.max()
+}
+
+/// One row of the usage card.
+public struct UsageRow: Equatable, Sendable {
+    public let key: String
+    public let title: String
+    /// Nil when Claude Code hasn't reported this window yet.
+    public let percent: Double?
+    public let resetsAt: Date?
+    public let hasReset: Bool
+
+    public var level: UsageLevel { usageLevel(percent ?? 0) }
+}
+
+/// Rows for the card: the two standard windows always (so the layout is stable before any data
+/// arrives), then any other window Claude Code reports, with a readable name.
+public func usageRows(_ state: UsageState?, now: Date) -> [UsageRow] {
+    let known = displayedWindows.map(\.key)
+    let extra = (state?.windows.keys.filter { !known.contains($0) } ?? []).sorted()
+
+    return (known + extra).map { key in
+        let title = displayedWindows.first { $0.key == key }?.long ?? humanize(key)
+        guard let w = state?.windows[key] else {
+            return UsageRow(key: key, title: title, percent: nil, resetsAt: nil, hasReset: false)
+        }
+        return UsageRow(key: key, title: title, percent: w.effectivePercentage(at: now),
+                        resetsAt: w.resetsAt, hasReset: w.hasReset(at: now))
+    }
+}
+
+func humanize(_ key: String) -> String {
+    let words = key.split(separator: "_").joined(separator: " ")
+    return words.prefix(1).uppercased() + words.dropFirst()
+}
+
 // MARK: - State file
 
 public struct StateStore {

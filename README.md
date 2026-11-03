@@ -2,9 +2,8 @@
 
 A small macOS menu bar app that shows your Claude plan usage: the 5-hour session limit and the 7-day weekly limit, with reset countdowns.
 
-```
-⏲ 5h 23% · 7d 41%
-```
+- **Menu bar:** a gauge and the percentage of whichever limit is closest to running out, coloured green (under 50%), yellow (under 75%), orange (under 90%) or red. If the menu bar has no room for the percentage, it shows the coloured gauge alone.
+- **Click it** for a card with a colour-coded bar per limit, reset times, when the numbers last updated, Open at Login and Quit.
 
 It holds **no credentials**. It never asks for a claude.ai cookie, never reads a token from the Keychain, and makes no network requests. The numbers come from Claude Code itself, which already passes them to its status line command.
 
@@ -50,7 +49,9 @@ Then add the status line to Claude Code's `settings.json` (`~/.claude/settings.j
 }
 ```
 
-The numbers appear after your next message in Claude Code. Use **Open at Login** in the menu to start the app automatically.
+The numbers appear after your next message in Claude Code. Use **Open at Login** in the card to start the app automatically.
+
+If you can't see the gauge, macOS has probably hidden it for lack of space (common beside the notch). Remove or ⌘-drag away another menu bar item, then relaunch the app.
 
 ### Show usage in Claude Code too
 
@@ -74,6 +75,7 @@ If you run more than one Claude Code configuration (for example separate `CLAUDE
 
 - Usage outside Claude Code (claude.ai, the desktop and mobile apps) shows up only after your next Claude Code response, since that is when Claude Code reports fresh numbers.
 - After a window resets with no newer data, the app shows 0% and says it is waiting for new data.
+- Only what Claude Code's status line reports is shown: no extra-usage credits, per-model weekly limits (unless Claude Code adds them, in which case they appear as extra rows), or service status.
 - `rate_limits` comes from Claude Code's documented status line input; if a plan doesn't report it, the menu shows "no data".
 
 ## State file
@@ -103,7 +105,7 @@ Then remove the `statusLine` entry from Claude Code's `settings.json`, and turn 
 ```
 Sources/UsageCore/            parsing, merge rules, formatting, state file (unit tested)
 Sources/claude-usage-export/  status line command
-Sources/ClaudeUsageMenubar/   AppKit menu bar app
+Sources/ClaudeUsageMenubar/   AppKit status item + SwiftUI card
 Tests/UsageCoreTests/         Swift Testing suite
 fixtures/                     sample status line input (anonymized)
 ```

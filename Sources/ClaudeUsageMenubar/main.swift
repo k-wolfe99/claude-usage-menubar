@@ -2,29 +2,70 @@
 // No network access, no Keychain access, no edits to any other app's configuration.
 import AppKit
 import ServiceManagement
+import SwiftUI
 import UsageCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+// MARK: - Model
+
+final class UsageModel: ObservableObject {
+    @Published var state: UsageState?
+    @Published var now = Date()
+    @Published var openAtLogin = SMAppService.mainApp.status == .enabled
+}
+
+extension UsageLevel {
+    var nsColor: NSColor {
+        switch self {
+        case .low: return .systemGreen
+        case .moderate: return .systemYellow
+        case .high: return .systemOrange
+        case .critical: return .systemRed
+        }
+    }
+    var color: Color { Color(nsColor: nsColor) }
+}
+
+// MARK: - App
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = StateStore()
+    private let model = UsageModel()
     private var statusItem: NSStatusItem!
-    private var state: UsageState?
+    private let popover = NSPopover()
     private var lastModified: Date?
     private var timer: Timer?
+    /// False once macOS has no room for "icon + %"; the app then shows the coloured icon alone.
+    private var percentFits = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            let icon = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "Claude usage")
-            icon?.isTemplate = true
-            button.image = icon
             button.imagePosition = .imageLeading
+            button.target = self
+            button.action = #selector(togglePopover(_:))
         }
 
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.delegate = self
-        statusItem.menu = menu
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = NSHostingController(rootView: UsageCard(
+            model: model,
+            toggleOpenAtLogin: { [weak self] in self?.toggleOpenAtLogin() },
+            quit: { NSApp.terminate(nil) }
+        ))
+
+        // When the item is hidden for lack of room, macOS parks its window above the screen.
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                               object: statusItem.button?.window, queue: .main) { [weak self] _ in
+            self?.checkPlacement()
+        }
+        // The menu bar may have room again after a display change or wake: try the full form again.
+        for (center, name) in [(NotificationCenter.default, NSApplication.didChangeScreenParametersNotification),
+                               (NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification)] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.percentFits = true
+                self?.updateStatusItem()
+            }
+        }
 
         refresh(forceReload: true)
         // Cheap poll: one stat() call every few seconds. Also keeps countdowns and resets current.
@@ -39,67 +80,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let modified = attributes?[.modificationDate] as? Date
         if forceReload || modified != lastModified {
             lastModified = modified
-            state = store.load()
+            model.state = store.load()
         }
-        let title = " " + menuBarTitle(state, now: Date())
-        if statusItem.button?.title != title {
-            statusItem.button?.title = title
-        }
+        model.now = Date()
+        updateStatusItem()
     }
 
-    // MARK: Menu
+    // MARK: Status item
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        refresh(forceReload: true)
-        menu.removeAllItems()
-        let now = Date()
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+        let percent = headlinePercent(model.state, now: model.now)
+        button.image = gaugeImage(percent)
+        button.toolTip = "Claude usage: " + menuBarTitle(model.state, now: model.now)
 
-        for window in displayedWindows {
-            if let w = state?.windows[window.key] {
-                menu.addItem(info("\(window.long): \(formatPercent(w.effectivePercentage(at: now))) used", bold: true))
-                if w.hasReset(at: now) {
-                    menu.addItem(info("Reset at \(clockTime(w.resetsAt, now: now)) · waiting for new data"))
-                } else {
-                    menu.addItem(info("Resets in \(formatCountdown(from: now, to: w.resetsAt)) · \(clockTime(w.resetsAt, now: now))"))
-                }
-            } else {
-                menu.addItem(info("\(window.long): no data", bold: true))
-            }
-        }
-
-        menu.addItem(.separator())
-        if let updated = state?.updatedAt {
-            let relative = RelativeDateTimeFormatter()
-            relative.unitsStyle = .full
-            menu.addItem(info("Updated \(relative.localizedString(for: updated, relativeTo: now))"))
+        let title: NSAttributedString
+        if let percent, percentFits {
+            title = NSAttributedString(string: " " + formatPercent(percent), attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .semibold),
+                .foregroundColor: usageLevel(percent).nsColor,
+            ])
         } else {
-            menu.addItem(info("No data yet. Send a message in Claude Code."))
+            title = NSAttributedString(string: "")
         }
-
-        menu.addItem(.separator())
-        let login = NSMenuItem(title: "Open at Login", action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
-        login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
-        let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
-    }
-
-    private func info(_ text: String, bold: Bool = false) -> NSMenuItem {
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        if bold {
-            item.attributedTitle = NSAttributedString(string: text, attributes: [.font: NSFont.menuFont(ofSize: 0).bold()])
+        if button.attributedTitle != title {
+            button.attributedTitle = title
+            // A wider title may no longer fit; check once macOS has placed it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.checkPlacement() }
         }
-        return item
     }
 
-    private func clockTime(_ date: Date, now: Date) -> String {
-        let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate(Calendar.current.isDate(date, inSameDayAs: now) ? "jmm" : "EEE jmm")
-        return f.string(from: date)
+    private func checkPlacement() {
+        guard let button = statusItem.button, let window = button.window,
+              !button.attributedTitle.string.isEmpty, window.frame.minY < 0 else { return }
+        percentFits = false
+        updateStatusItem()
     }
 
-    @objc private func toggleOpenAtLogin(_ sender: NSMenuItem) {
+    /// Gauge whose needle and colour follow usage. Plain template gauge before any data arrives.
+    private func gaugeImage(_ percent: Double?) -> NSImage? {
+        guard let percent else {
+            let image = NSImage(systemSymbolName: "gauge.with.dots.needle.0percent", accessibilityDescription: "Claude usage")
+            image?.isTemplate = true
+            return image
+        }
+        let needle: String
+        switch percent {
+        case ..<17: needle = "0"
+        case ..<42: needle = "33"
+        case ..<58: needle = "50"
+        case ..<83: needle = "67"
+        default: needle = "100"
+        }
+        let config = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [usageLevel(percent).nsColor]))
+        let image = NSImage(systemSymbolName: "gauge.with.dots.needle.\(needle)percent", accessibilityDescription: "Claude usage")?
+            .withSymbolConfiguration(config)
+        image?.isTemplate = false
+        return image
+    }
+
+    // MARK: Popover
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            refresh(forceReload: true)
+            model.openAtLogin = SMAppService.mainApp.status == .enabled
+            NSApp.activate()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    private func toggleOpenAtLogin() {
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled {
@@ -116,14 +171,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.informativeText = error.localizedDescription
             alert.runModal()
         }
+        model.openAtLogin = service.status == .enabled
     }
 }
 
-private extension NSFont {
-    func bold() -> NSFont {
-        NSFontManager.shared.convert(self, toHaveTrait: .boldFontMask)
+// MARK: - Card
+
+struct UsageCard: View {
+    @ObservedObject var model: UsageModel
+    let toggleOpenAtLogin: () -> Void
+    let quit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Claude Usage")
+                .font(.system(size: 15, weight: .semibold))
+
+            ForEach(usageRows(model.state, now: model.now), id: \.key) { row in
+                UsageRowView(row: row, now: model.now)
+            }
+
+            Divider()
+
+            Text(lastUpdated)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            HStack {
+                Toggle("Open at Login", isOn: Binding(get: { model.openAtLogin }, set: { _ in toggleOpenAtLogin() }))
+                    .toggleStyle(.checkbox)
+                Spacer()
+                Button("Quit", action: quit)
+                    .buttonStyle(.borderless)
+            }
+            .font(.callout)
+        }
+        .padding(18)
+        .frame(width: 320)
+    }
+
+    private var lastUpdated: String {
+        guard let updated = model.state?.updatedAt else {
+            return "No data yet. Send a message in Claude Code."
+        }
+        let relative = RelativeDateTimeFormatter()
+        relative.unitsStyle = .full
+        return "Last updated " + relative.localizedString(for: updated, relativeTo: model.now)
     }
 }
+
+struct UsageRowView: View {
+    let row: UsageRow
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(row.title)
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+                if let resetsAt = row.resetsAt {
+                    Text(resetLabel(resetsAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            UsageBar(fraction: (row.percent ?? 0) / 100, color: row.level.color)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var detail: String {
+        guard let percent = row.percent, let resetsAt = row.resetsAt else { return "No data yet" }
+        if row.hasReset { return "0% used · reset, waiting for new data" }
+        return "\(formatPercent(percent)) used · resets in \(formatCountdown(from: now, to: resetsAt))"
+    }
+
+    private func resetLabel(_ date: Date) -> String {
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        if calendar.isDate(date, inSameDayAs: now) {
+            formatter.setLocalizedDateFormatFromTemplate("jmm")
+            return (row.hasReset ? "Reset at " : "Resets at ") + formatter.string(from: date)
+        }
+        let withinWeek = date.timeIntervalSince(now) < 6 * 86_400
+        formatter.setLocalizedDateFormatFromTemplate(withinWeek ? "EEE jmm" : "d MMM")
+        return (row.hasReset ? "Reset " : "Resets ") + formatter.string(from: date)
+    }
+}
+
+struct UsageBar: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.1))
+                if fraction > 0 {
+                    Capsule().fill(color)
+                        .frame(width: max(geo.size.width * min(fraction, 1), 6))
+                }
+            }
+        }
+        .frame(height: 6)
+        .animation(.easeOut(duration: 0.3), value: fraction)
+    }
+}
+
+// MARK: - Entry point
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
