@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Model
@@ -43,15 +44,20 @@ public struct UsageState: Codable, Equatable, Sendable {
     public var updatedAt: Date
     /// Keyed by Claude Code's window name: "five_hour", "seven_day", ...
     public var windows: [String: UsageWindow]
+    /// Keychain item holding the login of the Claude Code install that wrote this file.
+    /// Recorded by the exporter; used only by the Refresh button.
+    public var credentialService: String?
 
-    public init(updatedAt: Date, windows: [String: UsageWindow]) {
+    public init(updatedAt: Date, windows: [String: UsageWindow], credentialService: String? = nil) {
         self.updatedAt = updatedAt
         self.windows = windows
+        self.credentialService = credentialService
     }
 
     enum CodingKeys: String, CodingKey {
         case updatedAt = "updated_at"
         case windows
+        case credentialService = "credential_service"
     }
 }
 
@@ -110,7 +116,7 @@ public func merge(_ state: UsageState?, readings: [String: RateLimitReading], no
     }
 
     guard changed else { return state }
-    return UsageState(updatedAt: now, windows: windows)
+    return UsageState(updatedAt: now, windows: windows, credentialService: state?.credentialService)
 }
 
 // MARK: - Formatting
@@ -228,9 +234,11 @@ public struct StateStore {
     }
 
     /// Merges readings into the file under an exclusive lock, so concurrent Claude Code sessions
-    /// can't lose each other's updates. Returns true if the file was rewritten.
+    /// can't lose each other's updates. `credentialService` (from the exporter) is recorded only
+    /// if it names a Claude Code login item. Returns true if the file was rewritten.
     @discardableResult
-    public func update(with readings: [String: RateLimitReading], now: Date = Date()) throws -> Bool {
+    public func update(with readings: [String: RateLimitReading], credentialService: String? = nil,
+                       now: Date = Date()) throws -> Bool {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
@@ -242,7 +250,11 @@ public struct StateStore {
         defer { flock(fd, LOCK_UN) }
 
         let current = load()
-        guard let next = merge(current, readings: readings, now: now), next != current else { return false }
+        guard var next = merge(current, readings: readings, now: now) else { return false }
+        if let service = credentialService, isValidCredentialService(service) {
+            next.credentialService = service
+        }
+        guard next != current else { return false }
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
@@ -251,4 +263,73 @@ public struct StateStore {
         try encoder.encode(next).write(to: url, options: .atomic)
         return true
     }
+}
+
+// MARK: - Refresh from Anthropic's usage endpoint
+
+/// Parses the response of `GET https://api.anthropic.com/api/oauth/usage` (the data behind
+/// Claude Code's `/usage`). Every top-level object with a numeric `utilization` and a
+/// `resets_at` timestamp is a window; null windows and other objects are skipped.
+public func parseOAuthUsage(_ data: Data) -> [String: RateLimitReading] {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+    var readings: [String: RateLimitReading] = [:]
+    for (name, value) in root {
+        guard let window = value as? [String: Any],
+              let used = window["utilization"] as? NSNumber, !(used is Bool),
+              let resetsString = window["resets_at"] as? String,
+              let resets = parseISO8601(resetsString) else { continue }
+        readings[name] = RateLimitReading(usedPercentage: used.doubleValue, resetsAt: resets)
+    }
+    return readings
+}
+
+/// ISO 8601 with any number of fractional digits (the API sends microseconds, which
+/// ISO8601DateFormatter does not reliably accept).
+func parseISO8601(_ string: String) -> Date? {
+    let pattern = #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$"#
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let m = regex.firstMatch(in: string, range: NSRange(string.startIndex..., in: string)),
+          let base = Range(m.range(at: 1), in: string),
+          let zone = Range(m.range(at: 3), in: string) else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    guard let whole = formatter.date(from: String(string[base]) + String(string[zone])) else { return nil }
+    let fraction = Range(m.range(at: 2), in: string).flatMap { Double("0" + string[$0]) } ?? 0
+    return whole.addingTimeInterval(fraction)
+}
+
+/// Keychain service under which Claude Code stores its login. With `CLAUDE_CONFIG_DIR` set,
+/// Claude Code suffixes it with the first 8 hex digits of the SHA-256 of that path.
+public func credentialService(configDir: String?) -> String {
+    let base = "Claude Code-credentials"
+    guard let dir = configDir, !dir.isEmpty else { return base }
+    return base + "-" + sha256Hex(Data(dir.utf8)).prefix(8)
+}
+
+/// Only Claude Code's own login items may be read.
+public func isValidCredentialService(_ name: String) -> Bool {
+    name.range(of: #"^Claude Code-credentials(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil
+}
+
+public enum TokenLookup: Equatable, Sendable {
+    case valid(String)
+    case expired
+    case missing
+}
+
+/// Extracts the OAuth access token from Claude Code's Keychain item. An expired token is
+/// reported rather than used: this app never renews tokens; Claude Code does that itself.
+public func accessToken(fromKeychainData data: Data, now: Date) -> TokenLookup {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let oauth = root["claudeAiOauth"] as? [String: Any],
+          let token = oauth["accessToken"] as? String, !token.isEmpty else { return .missing }
+    if let expiresMs = oauth["expiresAt"] as? NSNumber,
+       Date(timeIntervalSince1970: expiresMs.doubleValue / 1000) <= now {
+        return .expired
+    }
+    return .valid(token)
+}
+
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }

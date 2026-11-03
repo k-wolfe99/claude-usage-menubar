@@ -1,0 +1,28 @@
+{
+  "five_hour": {
+    "utilization": 7.0,
+    "resets_at": "2026-11-03T11:40:00.449944+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day": {
+    "utilization": 17.0,
+    "resets_at": "2026-11-05T05:00:00.449968+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 5000,
+    "used_credits": 0.0,
+    "utilization": null,
+    "currency": "USD"
+  },
+  "member_dashboard_available": false
+}

@@ -1,5 +1,6 @@
 // Menu bar app. Reads the state file written by claude-usage-export and shows it.
-// No network access, no Keychain access, no edits to any other app's configuration.
+// The only network and Keychain access is the optional Refresh button (see Refresh.swift).
+// Never edits any other app's configuration.
 import AppKit
 import ServiceManagement
 import SwiftUI
@@ -11,6 +12,9 @@ final class UsageModel: ObservableObject {
     @Published var state: UsageState?
     @Published var now = Date()
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var refreshing = false
+    /// Result of the last Refresh, shown under the title. Nil when there's nothing to say.
+    @Published var refreshError: String?
 }
 
 extension UsageLevel {
@@ -31,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = StateStore()
     private let model = UsageModel()
     private var statusItem: NSStatusItem!
-    private let popover = NSPopover()
+    private var panel: UsagePanel!
+    private lazy var fetcher = UsageFetcher(store: store)
     private var lastModified: Date?
     private var timer: Timer?
     /// False once macOS has no room for "icon + %"; the app then shows the coloured icon alone.
@@ -42,16 +47,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.imagePosition = .imageLeading
             button.target = self
-            button.action = #selector(togglePopover(_:))
+            button.action = #selector(togglePanel(_:))
         }
 
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentViewController = NSHostingController(rootView: UsageCard(
+        panel = UsagePanel(content: UsageCard(
             model: model,
             toggleOpenAtLogin: { [weak self] in self?.toggleOpenAtLogin() },
+            refresh: { [weak self] in self?.refreshFromAnthropic() },
             quit: { NSApp.terminate(nil) }
         ))
+        panel.onClose = { [weak self] in self?.statusItem.button?.highlight(false) }
 
         // When the item is hidden for lack of room, macOS parks its window above the screen.
         NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
@@ -110,11 +115,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// macOS first parks a new or resized item above the screen, then places it about a second
+    /// later. Only drop the percentage if the item is still off-screen after it has settled.
     private func checkPlacement() {
-        guard let button = statusItem.button, let window = button.window,
-              !button.attributedTitle.string.isEmpty, window.frame.minY < 0 else { return }
-        percentFits = false
-        updateStatusItem()
+        guard isParkedOffScreen else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.isParkedOffScreen else { return }
+            self.percentFits = false
+            self.updateStatusItem()
+        }
+    }
+
+    private var isParkedOffScreen: Bool {
+        guard let button = statusItem.button, let window = button.window else { return false }
+        return !button.attributedTitle.string.isEmpty && window.frame.minY < 0
     }
 
     /// Gauge whose needle and colour follow usage. Plain template gauge before any data arrives.
@@ -140,17 +154,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    // MARK: Popover
+    // MARK: Panel
 
-    @objc private func togglePopover(_ sender: Any?) {
+    @objc private func togglePanel(_ sender: Any?) {
         guard let button = statusItem.button else { return }
-        if popover.isShown {
-            popover.performClose(sender)
+        if panel.isVisible {
+            panel.dismiss()
+        } else if panel.dismissedJustNow {
+            // This click on the menu bar item already closed the panel: macOS draws the item in
+            // another process, so the "click outside" monitor sees the click before this action.
+            return
         } else {
             refresh(forceReload: true)
             model.openAtLogin = SMAppService.mainApp.status == .enabled
-            NSApp.activate()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            button.highlight(true)
+            panel.show(below: button)
+        }
+    }
+
+    private func refreshFromAnthropic() {
+        guard !model.refreshing else { return }
+        model.refreshing = true
+        model.refreshError = nil
+        fetcher.refresh { [weak self] result in
+            guard let self else { return }
+            self.model.refreshing = false
+            if case .failure(let error) = result {
+                self.model.refreshError = error.localizedDescription
+            }
+            self.refresh(forceReload: true)
         }
     }
 
@@ -175,17 +207,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Panel
+
+/// Borderless floating panel with a frosted background, dropped down below the menu bar item.
+/// (A plain NSPopover renders as a solid sheet with an arrow.)
+final class UsagePanel: NSPanel {
+    private let hosting: NSView
+    private var eventMonitors: [Any] = []
+    private var resignObserver: NSObjectProtocol?
+    private var dismissedAt = Date.distantPast
+    var onClose: (() -> Void)?
+
+    /// True right after the panel closed, so the same click doesn't immediately reopen it.
+    var dismissedJustNow: Bool { Date().timeIntervalSince(dismissedAt) < 0.35 }
+
+    init<Content: View>(content: Content) {
+        hosting = NSHostingView(rootView: content)
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .popUpMenu
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        isReleasedWhenClosed = false
+
+        // A solid background drawn by the app, so the panel looks the same whether or not
+        // Reduce Transparency is on (system glass changes with that setting). Everything is
+        // clipped to the rounded shape so no rectangular edge or shadow shows past the corners.
+        let background = PanelBackground()
+        background.wantsLayer = true
+        background.layer?.cornerRadius = Self.radius
+        background.layer?.cornerCurve = .continuous
+        background.layer?.masksToBounds = true
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            hosting.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            hosting.topAnchor.constraint(equalTo: background.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+        ])
+        contentView = background
+    }
+
+    static let radius: CGFloat = 16
+
+    // Borderless panels can't take key status by default; the checkbox and Esc need it.
+    override var canBecomeKey: Bool { true }
+
+    func show(below button: NSStatusBarButton) {
+        guard let anchor = button.window?.frame, let screen = button.window?.screen ?? NSScreen.main else { return }
+        let size = hosting.fittingSize
+        let visible = screen.visibleFrame
+        var x = anchor.midX - size.width / 2
+        x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
+        let y = anchor.minY - size.height - 6
+        setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        // Recompute the shadow from the rounded, clipped content rather than the old frame.
+        invalidateShadow()
+
+        NSApp.activate()
+        makeKeyAndOrderFront(nil)
+
+        // Close on a click anywhere else, on Esc, or when another app becomes active.
+        let click = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.dismiss()
+        }
+        let escape = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { self?.dismiss(); return nil }
+            return event
+        }
+        eventMonitors = [click, escape].compactMap { $0 }
+        resignObserver = NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            self?.dismiss()
+        }
+    }
+
+    func dismiss() {
+        guard isVisible else { return }
+        eventMonitors.forEach(NSEvent.removeMonitor)
+        eventMonitors.removeAll()
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        resignObserver = nil
+        orderOut(nil)
+        dismissedAt = Date()
+        onClose?()
+    }
+}
+
+/// Solid panel fill with a faint rim, following light/dark appearance.
+final class PanelBackground: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = (dark ? NSColor(white: 0.133, alpha: 1) : NSColor(white: 0.95, alpha: 1)).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = (dark ? NSColor(white: 1, alpha: 0.12) : NSColor(white: 0, alpha: 0.1)).cgColor
+    }
+}
+
 // MARK: - Card
 
 struct UsageCard: View {
     @ObservedObject var model: UsageModel
     let toggleOpenAtLogin: () -> Void
+    let refresh: () -> Void
     let quit: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.system(size: 15, weight: .semibold))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Claude Usage")
+                        .font(.system(size: 15, weight: .semibold))
+                    Spacer()
+                    if model.refreshing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button(action: refresh) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Fetch current usage from Anthropic, including claude.ai and the Claude apps. Uses Claude Code's login.")
+                    }
+                }
+                if let error = model.refreshError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             ForEach(usageRows(model.state, now: model.now), id: \.key) { row in
                 UsageRowView(row: row, now: model.now)

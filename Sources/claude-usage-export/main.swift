@@ -15,7 +15,10 @@ let store = StateStore()
 
 // A status line must never fail loudly: any error just leaves the previous state in place.
 if !readings.isEmpty {
-    _ = try? store.update(with: readings)
+    // Record which Claude Code login this data belongs to (the Keychain item *name*, never its
+    // contents), so the app's optional Refresh button uses the same account.
+    let service = credentialService(configDir: ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"])
+    _ = try? store.update(with: readings, credentialService: service)
 }
 
 if printSummary, let state = store.load() {
