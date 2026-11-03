@@ -11,7 +11,7 @@ A small macOS menu bar app that shows your Claude plan usage: the 5-hour session
 
 ### Without any credential (default)
 
-Install it and add the status line. The app then reads only a local file written by Claude Code's status line. It makes no network requests and never reads the Keychain. As long as you never click Refresh, it holds no credential of any kind.
+Install it and add the status line. The app then reads only a local file written by Claude Code's status line. It never reads the Keychain, and makes no network requests unless you click Refresh or Check for Updates. As long as you never click Refresh, it holds no credential of any kind.
 
 Limitations of this mode:
 
@@ -112,6 +112,12 @@ printf '%s' "$input" | ~/Applications/ClaudeUsageMenubar.app/Contents/Helpers/cl
 
 If you run more than one Claude Code configuration (for example separate `CLAUDE_CONFIG_DIR`s for different accounts), add the status line only to the configuration whose account you want to track. Each configuration reads its own `settings.json`. A configuration billed by API key never receives `rate_limits`, so even if it ran the exporter, nothing would be written.
 
+## Updates
+
+The card shows the installed version and a **Check for Updates** link. Clicking it sends one request to GitHub's public API for this repository's latest release (no login, nothing sent about you). If a newer version exists, **Download** opens its release page; install it the same way as the first time. The app never downloads or installs anything by itself, and never checks unless you click.
+
+The repository it checks is the `UpdateRepository` key in `Resources/Info.plist`, so a fork only needs to change that line.
+
 ## State file
 
 ```json
@@ -147,7 +153,16 @@ Tests/UsageCoreTests/         Swift Testing suite
 fixtures/                     sample status line input and usage API response (anonymized)
 ```
 
-`make test` runs the suite. `make dmg` builds the universal app and the disk image in `build/`. With only the Command Line Tools installed, it passes the Swift Testing macro plugin path that `swiftc` doesn't find on its own.
+`make test` runs the suite. `make dmg` builds the universal app and the disk image in `build/`.
+
+### Releasing
+
+```sh
+make release V=0.2.0 NOTES=~/notes-0.2.0.md DRY=1   # rehearse: builds the DMG, changes nothing
+make release V=0.2.0 NOTES=~/notes-0.2.0.md         # publish
+```
+
+`scripts/release.sh` checks you're on a clean `main` in sync with `origin`, that the version is newer and its tag doesn't exist, then bumps `Info.plist`, runs the tests, builds the DMG, commits, tags, pushes, and creates the GitHub release with the DMG and its SHA-256 appended to your notes. Keep the notes file outside the repository. With only the Command Line Tools installed, it passes the Swift Testing macro plugin path that `swiftc` doesn't find on its own.
 
 ## License
 

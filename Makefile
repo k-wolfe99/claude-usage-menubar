@@ -12,7 +12,7 @@ MIN_MACOS := 14.0
 TESTING_PLUGIN := $(shell xcode-select -p 2>/dev/null)/usr/lib/swift/host/plugins/testing
 TEST_FLAGS     := $(if $(wildcard $(TESTING_PLUGIN)),-Xswiftc -plugin-path -Xswiftc $(TESTING_PLUGIN))
 
-.PHONY: all test build app install uninstall clean universal dmg
+.PHONY: all test build app install uninstall clean universal dmg release
 
 all: app
 
@@ -53,6 +53,10 @@ install: app
 	@echo ""
 	@echo "Installed. Status line command for Claude Code's settings.json:"
 	@echo "  $(PREFIX)/$(APP_NAME).app/Contents/Helpers/claude-usage-export"
+
+# Publish a version: make release V=0.2.0 NOTES=~/notes.md   (add DRY=1 to rehearse)
+release:
+	@scripts/release.sh "$(V)" "$(NOTES)" $(if $(DRY),--dry-run)
 
 uninstall:
 	@osascript -e 'quit app id "$(BUNDLE_ID)"' >/dev/null 2>&1 || true

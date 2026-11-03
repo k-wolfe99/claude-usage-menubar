@@ -1,5 +1,6 @@
 // Menu bar app. Reads the state file written by claude-usage-export and shows it.
-// The only network and Keychain access is the optional Refresh button (see Refresh.swift).
+// The only network access is on click: Refresh (Refresh.swift, also the only Keychain access)
+// and Check for Updates (Updates.swift).
 // Never edits any other app's configuration.
 import AppKit
 import ServiceManagement
@@ -15,6 +16,7 @@ final class UsageModel: ObservableObject {
     @Published var refreshing = false
     /// Result of the last Refresh, shown under the title. Nil when there's nothing to say.
     @Published var refreshError: String?
+    @Published var updateStatus: UpdateStatus = .idle
 }
 
 extension UsageLevel {
@@ -37,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panel: UsagePanel!
     private lazy var fetcher = UsageFetcher(store: store)
+    private let updateChecker = UpdateChecker()
     private var lastModified: Date?
     private var timer: Timer?
     /// False once macOS has no room for "icon + %"; the app then shows the coloured icon alone.
@@ -54,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model: model,
             toggleOpenAtLogin: { [weak self] in self?.toggleOpenAtLogin() },
             refresh: { [weak self] in self?.refreshFromAnthropic() },
+            checkForUpdates: { [weak self] in self?.checkForUpdates() },
             quit: { NSApp.terminate(nil) }
         ))
         panel.onClose = { [weak self] in self?.statusItem.button?.highlight(false) }
@@ -186,6 +190,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func checkForUpdates() {
+        guard model.updateStatus != .checking else { return }
+        model.updateStatus = .checking
+        updateChecker.check { [weak self] status in self?.model.updateStatus = status }
+    }
+
     private func toggleOpenAtLogin() {
         let service = SMAppService.mainApp
         do {
@@ -314,6 +324,7 @@ struct UsageCard: View {
     @ObservedObject var model: UsageModel
     let toggleOpenAtLogin: () -> Void
     let refresh: () -> Void
+    let checkForUpdates: () -> Void
     let quit: () -> Void
 
     var body: some View {
@@ -348,9 +359,12 @@ struct UsageCard: View {
 
             Divider()
 
-            Text(lastUpdated)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(lastUpdated)
+                VersionRow(status: model.updateStatus, check: checkForUpdates)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
             Divider()
 
@@ -374,6 +388,39 @@ struct UsageCard: View {
         let relative = RelativeDateTimeFormatter()
         relative.unitsStyle = .full
         return "Last updated " + relative.localizedString(for: updated, relativeTo: model.now)
+    }
+}
+
+struct VersionRow: View {
+    let status: UpdateStatus
+    let check: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text("Version \(UpdateChecker.currentVersion) ·")
+                switch status {
+                case .idle:
+                    Button("Check for Updates", action: check).buttonStyle(.link).foregroundStyle(Color.accentColor)
+                case .checking:
+                    ProgressView().controlSize(.mini)
+                    Text("Checking…")
+                case .upToDate:
+                    Text("Up to date ·")
+                    Button("Check Again", action: check).buttonStyle(.link).foregroundStyle(Color.accentColor)
+                case .available(let release):
+                    Text("\(release.version) available ·").foregroundStyle(.primary)
+                    Button("Download") { NSWorkspace.shared.open(release.pageURL) }.buttonStyle(.link).foregroundStyle(Color.accentColor)
+                case .failed:
+                    Button("Try Again", action: check).buttonStyle(.link).foregroundStyle(Color.accentColor)
+                }
+            }
+            if case .failed(let message) = status {
+                Text(message)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 

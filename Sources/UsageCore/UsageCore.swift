@@ -333,3 +333,42 @@ public func accessToken(fromKeychainData data: Data, now: Date) -> TokenLookup {
 func sha256Hex(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
+
+// MARK: - Update check
+
+/// The latest published release, as reported by GitHub.
+public struct ReleaseInfo: Equatable, Sendable {
+    public let version: String
+    /// Release page on github.com (always https://github.com/...).
+    public let pageURL: URL
+}
+
+/// Parses `GET https://api.github.com/repos/{owner}/{repo}/releases/latest`. Drafts,
+/// prereleases and any link that isn't an https github.com page are rejected.
+public func parseLatestRelease(_ data: Data) -> ReleaseInfo? {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let tag = root["tag_name"] as? String,
+          (root["draft"] as? Bool) == false, (root["prerelease"] as? Bool) == false,
+          let page = (root["html_url"] as? String).flatMap(URL.init(string:)),
+          page.scheme == "https", page.host == "github.com",
+          versionComponents(tag) != nil else { return nil }
+    return ReleaseInfo(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, pageURL: page)
+}
+
+/// True if `candidate` is a strictly later dotted numeric version than `current`
+/// ("v" prefix allowed; missing components count as 0, so 0.1 == 0.1.0).
+public func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+    guard let a = versionComponents(candidate), let b = versionComponents(current) else { return false }
+    for i in 0..<max(a.count, b.count) {
+        let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+func versionComponents(_ version: String) -> [Int]? {
+    let trimmed = version.hasPrefix("v") ? String(version.dropFirst()) : version
+    let parts = trimmed.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+    guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+    return parts.compactMap { $0 }
+}
