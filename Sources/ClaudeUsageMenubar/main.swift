@@ -101,7 +101,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         let percent = headlinePercent(model.state, now: model.now)
         button.image = gaugeImage(percent)
-        button.toolTip = "Claude usage: " + menuBarTitle(model.state, now: model.now)
+        // No toolTip on purpose. The menu bar is drawn by another process, so after a hover this
+        // app never hears that the pointer left and the tooltip is never dismissed. Assigning
+        // toolTip while it is up re-shows it under the cursor, wherever that is, so the 5 s poll
+        // made it follow the pointer around the screen. The card has the same text on click.
+        let label = "Claude usage: " + menuBarTitle(model.state, now: model.now)
+        if button.accessibilityLabel() != label {
+            button.setAccessibilityLabel(label)
+        }
 
         let title: NSAttributedString
         if let percent, percentFits {
